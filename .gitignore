@@ -1,0 +1,8 @@
+objs/
+*.o
+*.ppm
+logs/
+saxpy/cudaSaxpy
+scan/cudaScan
+render/render
+__pycache__/
