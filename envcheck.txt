@@ -1,0 +1,11 @@
+== OS: "Ubuntu 24.04.5 LTS"
+== glibc: ldd (Ubuntu GLIBC 2.39-0ubuntu8.12) 2.39
+== arch: x86_64
+== GPU:
+NVIDIA GeForce RTX 3060, 8.6, 12288 MiB, 610.88
+== nvcc: Cuda compilation tools, release 12.8, V12.8.93
+== libraries the reference binaries need:
+ok: every library found
+== reference smoke tests (both must print a success line):
+Scan outputs are correct!
+***************** Correctness check passed **************************
