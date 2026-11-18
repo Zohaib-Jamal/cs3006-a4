@@ -1,0 +1,14 @@
+---------------------------------------------------------
+Found 1 CUDA devices
+Device 0: NVIDIA GeForce RTX 3060
+   SMs:        28
+   Global mem: 12288 MB
+   CUDA Cap:   8.6
+---------------------------------------------------------
+Running 3 timing tests:
+Effective BW by CUDA saxpy: 223.674 ms		[4.996 GB/s]
+Effective BW by CUDA saxpy (kernel only):          5.132 ms		[217.750 GB/s]
+Effective BW by CUDA saxpy: 209.444 ms		[5.336 GB/s]
+Effective BW by CUDA saxpy (kernel only):          3.685 ms		[303.291 GB/s]
+Effective BW by CUDA saxpy: 207.503 ms		[5.386 GB/s]
+Effective BW by CUDA saxpy (kernel only):          3.761 ms		[297.140 GB/s]
