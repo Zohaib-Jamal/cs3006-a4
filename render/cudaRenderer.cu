@@ -14,6 +14,10 @@
 #include "sceneLoader.h"
 #include "util.h"
 
+#define TILE_DIM 32
+#define BLOCK_SIZE (TILE_DIM * TILE_DIM)
+#define SCAN_BLOCK_DIM BLOCK_SIZE
+
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -42,8 +46,11 @@ __constant__ float  cuConstNoise1DValueTable[256];
 #define COLOR_MAP_SIZE 5
 __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 
+// External device helpers from starter code
 #include "noiseCuda.cu_inl"
 #include "lookupColor.cu_inl"
+#include "circleBoxTest.cu_inl"
+#include "exclusiveScan.cu_inl"
 
 
 __global__ void kernelClearImageSnowflake() {
@@ -248,17 +255,16 @@ __global__ void kernelAdvanceSnowflake() {
     *((float3*)velocityPtr) = velocity;
 }
 
-// By-reference variant of shadePixel that keeps the pixel color in a register
+// Register-accumulating pixel shader reading circle attributes from shared memory
 template <bool isSnowflake>
 __device__ __inline__ void
-shadePixelAccum(int circleIndex, float2 pixelCenter, float3 p, float rad, float4& accumColor) {
+shadePixelTiled(float2 pixelCenter, float3 p, float rad, float3 cachedRgb, float4& accumColor) {
 
     float diffX = p.x - pixelCenter.x;
     float diffY = p.y - pixelCenter.y;
     float pixelDist = diffX * diffX + diffY * diffY;
     float maxDist = rad * rad;
 
-    // circle does not contribute to the image
     if (pixelDist > maxDist)
         return;
 
@@ -276,8 +282,7 @@ shadePixelAccum(int circleIndex, float2 pixelCenter, float3 p, float rad, float4
         maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
         alpha = maxAlpha * expf(-1.f * falloffScale * normPixelDist * normPixelDist);
     } else {
-        int index3 = 3 * circleIndex;
-        rgb = *(float3*)&(cuConstRendererParams.color[index3]);
+        rgb = cachedRgb;
         alpha = .5f;
     }
 
@@ -288,42 +293,109 @@ shadePixelAccum(int circleIndex, float2 pixelCenter, float3 p, float rad, float4
     accumColor.w = alpha + accumColor.w;
 }
 
-// Baseline renderer: one thread per pixel, looping over circles 0..numCircles-1 in order
+// Tiled renderer: one 32x32 block (1024 threads) per 32x32 pixel tile
 template <bool isSnowflake>
-__global__ void kernelRenderCirclesBaseline() {
+__global__ void kernelRenderCirclesTiled() {
 
-    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
-    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+    __shared__ uint scanInput[BLOCK_SIZE];
+    __shared__ uint scanOutput[BLOCK_SIZE];
+    __shared__ uint scanScratch[2 * BLOCK_SIZE];
+    __shared__ int  tileCircles[BLOCK_SIZE];
+
+    __shared__ float3 sharedPos[BLOCK_SIZE];
+    __shared__ float  sharedRad[BLOCK_SIZE];
+    __shared__ float3 sharedCol[BLOCK_SIZE];
+
+    int linearTid = threadIdx.y * TILE_DIM + threadIdx.x;
+    int pixelX = blockIdx.x * TILE_DIM + threadIdx.x;
+    int pixelY = blockIdx.y * TILE_DIM + threadIdx.y;
 
     int imageWidth = cuConstRendererParams.imageWidth;
     int imageHeight = cuConstRendererParams.imageHeight;
-
-    if (pixelX >= imageWidth || pixelY >= imageHeight)
-        return;
-
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
+
+    // Normalized [0, 1] bounding box of this tile
+    int tileStartX = blockIdx.x * TILE_DIM;
+    int tileStartY = blockIdx.y * TILE_DIM;
+    int tileEndX = min(tileStartX + TILE_DIM, imageWidth);
+    int tileEndY = min(tileStartY + TILE_DIM, imageHeight);
+
+    float boxL = tileStartX * invWidth;
+    float boxR = tileEndX * invWidth;
+    float boxB = tileStartY * invHeight;
+    float boxT = tileEndY * invHeight;
+
+    bool inBounds = (pixelX < imageWidth && pixelY < imageHeight);
     float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
                                          invHeight * (static_cast<float>(pixelY) + 0.5f));
 
-    int offset = 4 * (pixelY * imageWidth + pixelX);
-    float4 accumColor = *(float4*)(&cuConstRendererParams.imageData[offset]);
+    int pixelOffset = 4 * (pixelY * imageWidth + pixelX);
+    float4 accumColor = inBounds
+        ? *(float4*)(&cuConstRendererParams.imageData[pixelOffset])
+        : make_float4(0.f, 0.f, 0.f, 0.f);
 
     int numCircles = cuConstRendererParams.numCircles;
-    for (int i = 0; i < numCircles; i++) {
-        float3 p = *(float3*)(&cuConstRendererParams.position[3 * i]);
-        float rad = cuConstRendererParams.radius[i];
 
-        // Quick bounding-box rejection
-        if (p.x - rad > pixelCenterNorm.x || p.x + rad < pixelCenterNorm.x ||
-            p.y - rad > pixelCenterNorm.y || p.y + rad < pixelCenterNorm.y) {
+    for (int chunkStart = 0; chunkStart < numCircles; chunkStart += BLOCK_SIZE) {
+        int circleIdx = chunkStart + linearTid;
+        uint overlaps = 0;
+
+        if (circleIdx < numCircles) {
+            float3 p = *(float3*)(&cuConstRendererParams.position[3 * circleIdx]);
+            float rad = cuConstRendererParams.radius[circleIdx];
+
+            // Note: circleBoxTest.cu_inl expects (boxL, boxR, boxT, boxB)
+            if (circleInBoxConservative(p.x, p.y, rad, boxL, boxR, boxT, boxB)) {
+                if (circleInBox(p.x, p.y, rad, boxL, boxR, boxT, boxB)) {
+                    overlaps = 1;
+                    sharedPos[linearTid] = p;
+                    sharedRad[linearTid] = rad;
+                    if (!isSnowflake) {
+                        sharedCol[linearTid] = *(float3*)(&cuConstRendererParams.color[3 * circleIdx]);
+                    }
+                }
+            }
+        }
+
+        // Fast-path: if zero circles in this 1024-circle chunk intersect the tile, skip scan and shading
+        if (!__syncthreads_or(overlaps)) {
             continue;
         }
 
-        shadePixelAccum<isSnowflake>(i, pixelCenterNorm, p, rad, accumColor);
+        scanInput[linearTid] = overlaps;
+        __syncthreads();
+
+        // Exclusive prefix sum across the 1024 flags
+        sharedMemExclusiveScan(linearTid, scanInput, scanOutput, scanScratch, BLOCK_SIZE);
+        __syncthreads();
+
+        int numInTile = scanOutput[BLOCK_SIZE - 1] + scanInput[BLOCK_SIZE - 1];
+        if (overlaps) {
+            tileCircles[scanOutput[linearTid]] = linearTid;
+        }
+        __syncthreads();
+
+        // Walk matching circles in strict ascending index order
+        if (inBounds) {
+            for (int i = 0; i < numInTile; i++) {
+                int localIdx = tileCircles[i];
+                shadePixelTiled<isSnowflake>(
+                    pixelCenterNorm,
+                    sharedPos[localIdx],
+                    sharedRad[localIdx],
+                    sharedCol[localIdx],
+                    accumColor);
+            }
+        }
+
+        // Ensure all threads finish reading shared arrays before next chunk overwrites them
+        __syncthreads();
     }
 
-    *(float4*)(&cuConstRendererParams.imageData[offset]) = accumColor;
+    if (inBounds) {
+        *(float4*)(&cuConstRendererParams.imageData[pixelOffset]) = accumColor;
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -496,15 +568,15 @@ CudaRenderer::advanceAnimation() {
 void
 CudaRenderer::render() {
 
-    dim3 blockDim(16, 16, 1);
+    dim3 blockDim(TILE_DIM, TILE_DIM, 1);
     dim3 gridDim(
-        (image->width + blockDim.x - 1) / blockDim.x,
-        (image->height + blockDim.y - 1) / blockDim.y);
+        (image->width + TILE_DIM - 1) / TILE_DIM,
+        (image->height + TILE_DIM - 1) / TILE_DIM);
 
     if (sceneName == SNOWFLAKES || sceneName == SNOWFLAKES_SINGLE_FRAME) {
-        kernelRenderCirclesBaseline<true><<<gridDim, blockDim>>>();
+        kernelRenderCirclesTiled<true><<<gridDim, blockDim>>>();
     } else {
-        kernelRenderCirclesBaseline<false><<<gridDim, blockDim>>>();
+        kernelRenderCirclesTiled<false><<<gridDim, blockDim>>>();
     }
     cudaDeviceSynchronize();
 }
