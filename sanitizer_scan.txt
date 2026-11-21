@@ -1,0 +1,24 @@
+========= COMPUTE-SANITIZER
+---------------------------------------------------------
+Found 1 CUDA devices
+Device 0: NVIDIA GeForce RTX 3060
+   SMs:        28
+   Global mem: 12288 MB
+   CUDA Cap:   8.6
+---------------------------------------------------------
+Array size: 1000003
+Student GPU time: 12.759 ms
+Scan outputs are correct!
+========= ERROR SUMMARY: 0 errors
+========= COMPUTE-SANITIZER
+---------------------------------------------------------
+Found 1 CUDA devices
+Device 0: NVIDIA GeForce RTX 3060
+   SMs:        28
+   Global mem: 12288 MB
+   CUDA Cap:   8.6
+---------------------------------------------------------
+Array size: 1000003
+Student GPU time: 18.815 ms
+Find_repeats outputs are correct!
+========= ERROR SUMMARY: 0 errors
